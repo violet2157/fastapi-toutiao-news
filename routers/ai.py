@@ -1,25 +1,14 @@
-import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
-from config.ai_conf import DASHSCOPE_API_KEY, DASHSCOPE_ENDPOINT, DASHSCOPE_MODEL
+from ai.agent import stream_agent_response
+from ai.vector_store import get_retriever, is_index_ready, rebuild_index
 from config.db_config import get_db
-from crud.news import search_news
 from models.users import User
 from utils.auth import get_current_user
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
-
-
-def build_context(articles) -> str:
-    if not articles:
-        return ""
-    items = []
-    for i, n in enumerate(articles, 1):
-        desc = n.description or (n.content[:100] if n.content else "")
-        items.append(f"{i}. 【{n.title}】{desc}")
-    return "\n".join(items)
 
 
 @router.post("/chat")
@@ -29,37 +18,62 @@ async def ai_chat(
     db: AsyncSession = Depends(get_db),
 ):
     messages = body.get("messages", [])
-    user_question = messages[-1]["content"] if messages else ""
+    thread_id = body.get("thread_id", str(user.id))
 
-    # RAG检索：从数据库搜索相关新闻
-    related_articles = await search_news(db, user_question)
-    context = build_context(related_articles)
-
-    system_content = "你是新闻助手，用中文回复。"
-    if context:
-        system_content += f"\n\n以下数据库中与用户问题相关的新闻，请优先基于这些新闻回答：\n{context}\n\n你只能基于以下数据库新闻回答。如果数据库新闻无法回答问题，请如实告知用户\"数据库暂无相关信息\"。"
-
-    payload = {
-        "model": DASHSCOPE_MODEL,
-        "messages": [
-            {"role": "system", "content": system_content},
-            *messages,
-        ],
-        "stream": True,
-        "temperature": 0.7,
-        "max_tokens": 1024,
-        "top_p": 0.9,
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
-    }
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages不能为空")
+    if not is_index_ready():
+        raise HTTPException(status_code=503, detail="向量索引未就绪，请先调用 /api/ai/rebuild-index")
 
     async def generate():
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream("POST", DASHSCOPE_ENDPOINT, json=payload, headers=headers) as r:
-                async for chunk in r.aiter_bytes():
-                    yield chunk
+        try:
+            async for token in stream_agent_response(db, user, messages, thread_id):
+                yield f"data: {token}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: [ERROR] {str(e)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.post("/search")
+async def semantic_search(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """纯语义搜索：不经过 LLM，直接返回向量检索结果。"""
+    query = body.get("query", "")
+    if not query:
+        raise HTTPException(status_code=400, detail="query参数不能为空")
+    if not is_index_ready():
+        raise HTTPException(status_code=503, detail="向量索引未就绪，请先调用 /api/ai/rebuild-index")
+
+    retriever = get_retriever()
+    docs = await retriever.ainvoke(query)
+    results = [
+        {
+            "news_id": doc.metadata.get("news_id"),
+            "title": doc.metadata.get("title"),
+            "content": doc.page_content[:300],
+            "score": doc.metadata.get("score", 0),
+        }
+        for doc in docs
+    ]
+    return {"code": 200, "data": results, "message": "ok"}
+
+
+@router.post("/rebuild-index")
+async def rebuild_search_index(db: AsyncSession = Depends(get_db)):
+    """从 MySQL 重建向量索引（管理接口）。"""
+    try:
+        count = await rebuild_index(db)
+        return {"code": 200, "data": {"indexed_docs": count}, "message": f"成功重建索引，共 {count} 条文档"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"索引重建失败: {str(e)}")
+
+
+@router.get("/index-status")
+async def index_status():
+    """检查向量索引状态。"""
+    ready = is_index_ready()
+    return {"code": 200, "data": {"ready": ready}, "message": "ok"}
