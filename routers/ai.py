@@ -1,8 +1,10 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
-from ai.agent import stream_agent_response
+from ai.agent import resume_agent_response, stream_agent_response
 from ai.vector_store import get_retriever, is_index_ready, rebuild_index
 from config.db_config import get_db
 from models.users import User
@@ -11,11 +13,23 @@ from utils.auth import get_current_user
 router = APIRouter(prefix="/api/ai", tags=["ai"])
 
 
+def _sse(item) -> str:
+    """把 agent 流里的一项转成 SSE 报文。
+
+    - str            → 普通的模型输出分片
+    - {"interrupt":…} → 需要人工审批：前端收到 [INTERRUPT] 后应弹出审批框，
+                        再调 /api/ai/approve 继续。
+    """
+    if isinstance(item, dict) and "interrupt" in item:
+        payload = json.dumps(item["interrupt"], ensure_ascii=False)
+        return f"data: [INTERRUPT] {payload}\n\n"
+    return f"data: {item}\n\n"
+
+
 @router.post("/chat")
 async def ai_chat(
     body: dict,
     user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ):
     messages = body.get("messages", [])
     thread_id = body.get("thread_id", str(user.id))
@@ -27,8 +41,41 @@ async def ai_chat(
 
     async def generate():
         try:
-            async for token in stream_agent_response(db, user, messages, thread_id):
-                yield f"data: {token}\n\n"
+            async for item in stream_agent_response(user, messages, thread_id):
+                yield _sse(item)
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: [ERROR] {str(e)}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.post("/approve")
+async def ai_approve(
+    body: dict,
+    user: User = Depends(get_current_user),
+):
+    """人工审批：批准/拒绝 agent 暂停下来的工具调用，然后继续流式返回。
+
+    请求体示例：
+        {"thread_id": "1", "decision": "approve"}
+        {"thread_id": "1", "decision": "reject", "message": "不想看这条"}
+    """
+    thread_id = body.get("thread_id", str(user.id))
+    decision = body.get("decision", "approve")
+    message = body.get("message")
+
+    if decision not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="decision 只能是 approve 或 reject")
+
+    one: dict = {"type": decision}
+    if message:
+        one["message"] = message
+
+    async def generate():
+        try:
+            async for item in resume_agent_response(user, thread_id, [one]):
+                yield _sse(item)
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: [ERROR] {str(e)}\n\n"

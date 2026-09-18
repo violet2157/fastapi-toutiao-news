@@ -1,13 +1,22 @@
 from langchain_core.tools import tool
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai.vector_store import get_retriever
+from config.db_config import AsyncSessionLocal
 from crud import favorite, history, news
 from models.users import User
 
 
-def create_tools(db: AsyncSession, user: User):
-    """创建 Agent 工具集，注入数据库会话和当前用户。"""
+def create_tools(user: User):
+    """创建 Agent 工具集。
+
+    这里只注入 user，不注入请求里的 db session：每个工具自己用
+    AsyncSessionLocal() 开一个短连接，用完就关。
+
+    原因：带 checkpointer + 人工审批时，一次对话会被拆成多个 HTTP 请求
+    （发起对话 → agent 暂停等审批 → 前端批准 → 恢复执行）。工具若攥着
+    「发起对话」那个请求的 session，审批回来时它早被关掉了，恢复执行必然报错。
+    各自开 session 才能真正跨请求复用。
+    """
     retriever = get_retriever()
 
     @tool
@@ -28,16 +37,25 @@ def create_tools(db: AsyncSession, user: User):
     async def get_news_detail(news_id: int) -> str:
         """获取指定新闻的详细内容。当用户想看某条新闻的完整内容时使用。
         参数 news_id: 新闻ID。"""
-        detail = await news.get_news_detail(db, news_id)
-        if not detail:
-            return f"新闻ID {news_id} 不存在。"
-        await news.increase_news_views(db, news_id)
-        return f"标题：{detail.title}\n作者：{detail.author or '未知'}\n发布时间：{detail.publish_time}\n内容：{detail.content}"
+        # 这个工具被配成了需要人工审批（见 config/ai_conf.py 的 HITL_TOOLS）
+        async with AsyncSessionLocal() as db:
+            detail = await news.get_news_detail(db, news_id)
+            if not detail:
+                return f"新闻ID {news_id} 不存在。"
+            await news.increase_news_views(db, news_id)
+            await db.commit()  # 自己开的 session 要自己提交
+            return (
+                f"标题：{detail.title}\n"
+                f"作者：{detail.author or '未知'}\n"
+                f"发布时间：{detail.publish_time}\n"
+                f"内容：{detail.content}"
+            )
 
     @tool
     async def get_categories() -> str:
         """获取所有新闻分类列表。当用户想了解有哪些新闻分类时使用。"""
-        cats = await news.get_categories(db)
+        async with AsyncSessionLocal() as db:
+            cats = await news.get_categories(db)
         if not cats:
             return "暂无分类。"
         return "\n".join(f"- {c.name} (ID:{c.id})" for c in cats)
@@ -46,7 +64,8 @@ def create_tools(db: AsyncSession, user: User):
     async def get_favorites(page: int = 1, page_size: int = 10) -> str:
         """获取当前用户的收藏列表。当用户想看自己的收藏、我的收藏时使用。
         参数 page: 页码，默认1。page_size: 每页数量，默认10。"""
-        rows, total = await favorite.get_favorite_list(db, user.id, page, page_size)
+        async with AsyncSessionLocal() as db:
+            rows, total = await favorite.get_favorite_list(db, user.id, page, page_size)
         if not rows:
             return "你还没有收藏任何新闻。"
         items = []
@@ -58,7 +77,8 @@ def create_tools(db: AsyncSession, user: User):
     async def get_history(page: int = 1, page_size: int = 10) -> str:
         """获取当前用户的阅读历史。当用户想看浏览记录、阅读历史时使用。
         参数 page: 页码，默认1。page_size: 每页数量，默认10。"""
-        rows, total = await history.get_history_list(db, user.id, page, page_size)
+        async with AsyncSessionLocal() as db:
+            rows, total = await history.get_history_list(db, user.id, page, page_size)
         if not rows:
             return "你还没有浏览记录。"
         items = []
@@ -70,25 +90,33 @@ def create_tools(db: AsyncSession, user: User):
     async def recommend_by_history(limit: int = 5) -> str:
         """基于用户阅读历史推荐文章。当用户想要推荐、猜你喜欢时使用。
         参数 limit: 推荐数量，默认5。"""
-        rows, total = await history.get_history_list(db, user.id, 1, 5)
-        if not rows:
-            return "你还没有浏览记录，无法基于历史推荐。可以先浏览一些新闻。"
-        category_ids = set()
-        for news_obj, _, _ in rows:
-            category_ids.add(news_obj.category_id)
-        if not category_ids:
-            return "暂无推荐数据。"
-        recommendations = []
-        for cid in category_ids:
-            related = await news.get_related_news(db, rows[0][0].id, cid, limit)
-            recommendations.extend(related)
-            if len(recommendations) >= limit:
-                break
-        if not recommendations:
-            return "暂无推荐内容。"
-        items = []
-        for i, n in enumerate(recommendations[:limit], 1):
-            items.append(f"{i}. [{n.id}] {n.title} — {n.author or '未知'}")
-        return "为你推荐：\n" + "\n".join(items)
+        async with AsyncSessionLocal() as db:
+            rows, total = await history.get_history_list(db, user.id, 1, 5)
+            if not rows:
+                return "你还没有浏览记录，无法基于历史推荐。可以先浏览一些新闻。"
+            category_ids = set()
+            for news_obj, _, _ in rows:
+                category_ids.add(news_obj.category_id)
+            if not category_ids:
+                return "暂无推荐数据。"
+            recommendations = []
+            for cid in category_ids:
+                related = await news.get_related_news(db, rows[0][0].id, cid, limit)
+                recommendations.extend(related)
+                if len(recommendations) >= limit:
+                    break
+            if not recommendations:
+                return "暂无推荐内容。"
+            items = []
+            for i, n in enumerate(recommendations[:limit], 1):
+                items.append(f"{i}. [{n.id}] {n.title} — {n.author or '未知'}")
+            return "为你推荐：\n" + "\n".join(items)
 
-    return [search_news, get_news_detail, get_categories, get_favorites, get_history, recommend_by_history]
+    return [
+        search_news,
+        get_news_detail,
+        get_categories,
+        get_favorites,
+        get_history,
+        recommend_by_history,
+    ]

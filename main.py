@@ -1,9 +1,22 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from ai.agent import close_checkpointer, init_checkpointer
 from routers import news, users, favorite, history, ai
 from utils.exception_handlers import register_error_handlers
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期：启动时准备持久化 checkpointer，关闭时释放连接。"""
+    await init_checkpointer()
+    yield
+    await close_checkpointer()
+
+
+app = FastAPI(lifespan=lifespan)
 #注册异常处理器
 register_error_handlers(app)
 #CORS中间件配置
