@@ -36,7 +36,6 @@ def create_tools(user: User):
     async def get_news_detail(news_id: int) -> str:
         """获取指定新闻的详细内容。当用户想看某条新闻的完整内容时使用。
         参数 news_id: 新闻ID。"""
-        # 这个工具被配成了需要人工审批（见 config/ai_conf.py 的 HITL_TOOLS）
         async with AsyncSessionLocal() as db:
             detail = await news.get_news_detail(db, news_id)
             if not detail:

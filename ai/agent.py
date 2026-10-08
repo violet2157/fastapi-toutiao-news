@@ -213,7 +213,7 @@ async def _stream_events(agent, payload, config):
                 yield chunk.content
         elif kind == "on_tool_start":
             # 工具开始执行：把工具名和入参推给前端做「工具调用可视化」。
-            # 注意：被人工审批拦下的工具（如 get_news_detail）会先走 interrupt、
+            # 注意：被人工审批拦下的工具（如 clear_favorites）会先走 interrupt、
             # 批准后才真正执行，所以它的 on_tool_start 会出现在批准之后。
             yield {"tool": {"name": event.get("name"), "input": event.get("data", {}).get("input")}}
         elif kind == "on_tool_end":
