@@ -1,4 +1,4 @@
-from sqlalchemy import select,update
+from sqlalchemy import select,update,delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.users import User, UserToken#模型类
@@ -37,22 +37,24 @@ async def create_user(db:AsyncSession,user_data:UserRequest):
 
 #生成token
 async def create_token(db:AsyncSession,user_id: int):
-    #生成token+设置过期时间->查询db当前用户是否有token->有则更新 无则添加
+    # 每次登录都新发一把 token（插一行），而不是覆盖这个用户的旧 token。
+    # 原因：原来是「一个用户只保留一行，登录时覆盖旧的」，于是
+    #   「在手机上登录 → 电脑上那把 token 立刻失效 → 电脑继续请求就 401」。
+    # 改成每次插入新行后，手机、电脑等多设备可以同时保持登录。
     token = str(uuid.uuid4())
     expires_at = datetime.now() + timedelta(days=3)
-    query = select(UserToken).where(UserToken.user_id == user_id)
-    r1 = await db.execute(query)
-    user_token = r1.scalar_one_or_none()
+    db.add(UserToken(user_id=user_id, token=token, expires_at=expires_at))
 
-    if user_token:
-        user_token.token = token
-        user_token.expires_at = expires_at #有token更新
-    else:
-        user_token = UserToken(user_id=user_id, token=token, expires_at=expires_at)
-        db.add(user_token) #无token添加
+    # 顺手清掉这个用户已过期的 token，避免表被历史 token 撑大
+    await db.execute(
+        delete(UserToken).where(
+            UserToken.user_id == user_id,
+            UserToken.expires_at < datetime.now(),
+        )
+    )
+
     # 只flush不commit，由get_db统一提交，避免事务管理混乱
     await db.flush()
-    await db.refresh(user_token)
     return token
 
 #登录验证用户

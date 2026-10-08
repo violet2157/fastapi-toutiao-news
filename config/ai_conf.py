@@ -11,19 +11,8 @@ DASHSCOPE_ENDPOINT = os.getenv("DASHSCOPE_ENDPOINT", "https://api.deepseek.com/v
 # 要用干净文本输出请用 deepseek-chat
 DASHSCOPE_MODEL = os.getenv("DASHSCOPE_MODEL", "deepseek-chat")
 
-# ========== Embedding 模型配置 (本地模型，支持中文) ==========
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "shibing624/text2vec-base-chinese")
-EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cpu")
-
-# ========== 向量库配置 ==========
-VECTOR_STORE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "chroma_db")
-
-# ========== 文档分块参数 ==========
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
-
-# ========== RAG 检索参数 ==========
-RETRIEVER_TOP_K = 5
+# 新闻检索不再用本地 embedding 模型 + Chroma 向量库，改成 MySQL 全文索引
+# （FULLTEXT + ngram），见 crud/news.py。所以这里没有 embedding / 分块 / 向量库配置了。
 
 # ========== Agent 配置 ==========
 AGENT_MAX_ITERATIONS = 6
@@ -40,6 +29,13 @@ CHECKPOINT_DB = os.path.join(
 # ========== 人工审批 (Human-in-the-Loop) 配置 ==========
 # 需要「人工审批」才能执行的工具名列表。agent 调这些工具前会暂停，
 # 等前端调 /api/ai/approve 批准后才真正执行。
-# 真实企业场景里，这里放的是有副作用/高风险的工具（发邮件、下单、删数据…）；
-# 本项目工具只读为主，拿 get_news_detail（读全文+累加浏览量）作演示。
-HITL_TOOLS = ["get_news_detail"]
+#
+# 为什么是这几个「删除类」工具？
+#   审批的意义在于「有副作用 / 不可逆的动作，先让人确认一下」。
+#   之前拿 get_news_detail 当示例其实说不通——它只是只读（顶多浏览量 +1），
+#   批准它纯属多余的一步。换成真正会删数据的工具后这个机制才成立：
+#   agent 说「我要清空你的收藏」→ 用户点批准 → 才真的删。
+# 原则：只给「会改数据」的工具加审批，只读工具（搜索/看详情/看列表）不加，避免无意义打断。
+# 真实企业场景里，这里放的是发邮件、下单、改配置、删数据这类高风险工具；
+# 更严格的做法还会把审批路由给「另一个角色」（如主管），即职责分离。
+HITL_TOOLS = ["clear_history", "remove_favorite", "clear_favorites"]

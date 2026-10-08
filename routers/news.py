@@ -56,7 +56,7 @@ async def get_news_detail(news_id: int = Query(..., alias="id"), db: AsyncSessio
     news_detail = await news_cache.get_news_detail(db, news_id)
     if not news_detail:
         raise HTTPException(404, detail='新闻不存在')
-    await news_cache.increase_news_views(db, news_detail["id"])
+    new_views = await news_cache.increase_news_views(db, news_detail["id"])
     related_news = await news_cache.get_related_news(db, news_detail["id"], news_detail["category_id"])
     return {
         "code": 200,
@@ -69,7 +69,7 @@ async def get_news_detail(news_id: int = Query(..., alias="id"), db: AsyncSessio
             "author": news_detail["author"],
             "publishTime": news_detail["publish_time"],
             "categoryId": news_detail["category_id"],
-            "views": news_detail["views"],
+            "views": new_views,
             "relatedNews": related_news
         }
     }

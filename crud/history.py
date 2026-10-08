@@ -24,8 +24,8 @@ async def add_news_history(
     result = await db.execute(query)
     existing = result.scalar_one_or_none()
     if existing:
-        #curr = update(History).where(History.user_id == user_id, History.news_id == news_id).values(viewed_at = datetime.now())
-        existing.viewed_at = datetime.utcnow()
+        #curr = update(History).where(History.user_id == user_id, History.news_id == news_id).values(view_time = datetime.now())
+        existing.view_time = datetime.utcnow()
         await db.commit()
         await db.refresh(existing)
         return existing
@@ -51,10 +51,10 @@ async def get_history_list(
     #获取历史列表  查询历史表和新闻表  需要联表查询join
     # select(查询主体模型类,字段别名).join(联合查询的模型类，联合查询的条件).where().order_by().offset().limit()
     #
-    query = (select(News, History.viewed_at.label("history_time"),History.id.label("history_id"))
+    query = (select(News, History.view_time.label("history_time"),History.id.label("history_id"))
              .join(History,History.news_id == News.id)
              .where(History.user_id == user_id)
-             .order_by(History.viewed_at.desc())
+             .order_by(History.view_time.desc())
              .offset((page-1)*page_size).limit(page_size)
              )
     r1 = await db.execute(query)

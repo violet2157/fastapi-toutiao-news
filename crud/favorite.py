@@ -5,12 +5,12 @@ from models.news import News
 
 
 async def is_news_favorite(
-        da:AsyncSession,
+        db:AsyncSession,
         user_id:int,
         news_id:int
 ):
     query = select(Favorite).where(Favorite.user_id == user_id, Favorite.news_id == news_id)
-    r1 = await da.execute(query)
+    r1 = await db.execute(query)
     #是否有收藏记录
     return r1.scalar_one_or_none() is not None
 

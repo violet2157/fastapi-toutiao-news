@@ -1,6 +1,5 @@
 from langchain_core.tools import tool
 
-from ai.vector_store import get_retriever
 from config.db_config import AsyncSessionLocal
 from crud import favorite, history, news
 from models.users import User
@@ -17,20 +16,20 @@ def create_tools(user: User):
     「发起对话」那个请求的 session，审批回来时它早被关掉了，恢复执行必然报错。
     各自开 session 才能真正跨请求复用。
     """
-    retriever = get_retriever()
-
     @tool
     async def search_news(query: str) -> str:
-        """语义搜索新闻。当用户想查找某类新闻、询问某个话题相关的新闻时使用。
+        """搜索新闻。当用户想查找某类新闻、询问某个话题相关的新闻时使用。
         参数 query: 搜索关键词或问题描述。"""
-        docs = await retriever.ainvoke(query)
-        if not docs:
+        async with AsyncSessionLocal() as db:
+            rows = await news.search_news(db, query, limit=5)
+        if not rows:
             return "未找到相关新闻。"
         items = []
-        for i, doc in enumerate(docs, 1):
-            title = doc.metadata.get("title", "无标题")
-            news_id = doc.metadata.get("news_id", "")
-            items.append(f"{i}. [{news_id}] {title}\n   {doc.page_content[:200]}...")
+        for i, (n, _score) in enumerate(rows, 1):
+            # 编号用自然序号（1. 2. 3.），news_id 标成「内部字段」：
+            # 它是给模型调 get_news_detail 用的，不该原样展示给用户
+            desc = (n.description or "").strip()
+            items.append(f"{i}. {n.title} (news_id={n.id})\n   {desc[:200]}...")
         return "\n\n".join(items)
 
     @tool
@@ -69,8 +68,10 @@ def create_tools(user: User):
         if not rows:
             return "你还没有收藏任何新闻。"
         items = []
-        for news_obj, fav_time, fav_id in rows:
-            items.append(f"- [{fav_id}] {news_obj.title} (收藏于 {fav_time})")
+        for news_obj, fav_time, _fav_id in rows:
+            # 注意要暴露的是「新闻ID」而不是收藏表ID：
+            # remove_favorite 接收的是 news_id，给收藏表ID会删错/删不掉
+            items.append(f"- {news_obj.title} (收藏于 {fav_time}) (news_id={news_obj.id})")
         return f"共 {total} 条收藏（第{page}页）：\n" + "\n".join(items)
 
     @tool
@@ -82,8 +83,9 @@ def create_tools(user: User):
         if not rows:
             return "你还没有浏览记录。"
         items = []
-        for news_obj, view_time, hist_id in rows:
-            items.append(f"- [{hist_id}] {news_obj.title} (浏览于 {view_time})")
+        for news_obj, view_time, _hist_id in rows:
+            # 同样暴露新闻ID（后续推荐/看详情都用得到）
+            items.append(f"- {news_obj.title} (浏览于 {view_time}) (news_id={news_obj.id})")
         return f"共 {total} 条历史（第{page}页）：\n" + "\n".join(items)
 
     @tool
@@ -109,8 +111,43 @@ def create_tools(user: User):
                 return "暂无推荐内容。"
             items = []
             for i, n in enumerate(recommendations[:limit], 1):
-                items.append(f"{i}. [{n.id}] {n.title} — {n.author or '未知'}")
+                items.append(f"{i}. {n.title} — {n.author or '未知'} (news_id={n.id})")
             return "为你推荐：\n" + "\n".join(items)
+
+    @tool
+    async def clear_history() -> str:
+        """清空当前用户的全部浏览记录。这是一个不可恢复的删除操作。
+        只有当用户明确要求「清空 / 删除浏览历史」时才调用。"""
+        # 这个工具被配成了需要人工审批（见 config/ai_conf.py 的 HITL_TOOLS）：
+        # agent 调它会先 interrupt 暂停，等用户在界面上点「批准」才真正执行删除。
+        # 这样「删数据」这种不可逆动作就不会在用户不知情的情况下发生。
+        async with AsyncSessionLocal() as db:
+            count = await history.remove_all_history(db, user.id)
+        if count:
+            return f"已清空该用户的全部浏览记录，共删除 {count} 条。"
+        return "该用户本来就没有浏览记录，无需清空。"
+
+    @tool
+    async def remove_favorite(news_id: int) -> str:
+        """取消收藏指定的一条新闻。当用户想取消收藏、不再收藏某条新闻时使用。
+        参数 news_id: 要取消收藏的新闻ID（可以从收藏列表或搜索结果里的 [数字] 拿到）。"""
+        # 破坏性操作：和 clear_history 一样会走人工审批，用户批准后才真正删除
+        async with AsyncSessionLocal() as db:
+            ok = await favorite.remove_news_favorite(db, user.id, news_id)
+        if ok:
+            return f"已取消收藏新闻 {news_id}。"
+        return f"新闻 {news_id} 本来就不在收藏里，无需取消。"
+
+    @tool
+    async def clear_favorites() -> str:
+        """清空当前用户的全部收藏。这是一个不可恢复的删除操作。
+        只有当用户明确要求「清空 / 删除全部收藏」时才调用。"""
+        # 破坏性操作：会走人工审批
+        async with AsyncSessionLocal() as db:
+            count = await favorite.remove_all_favorite(db, user.id)
+        if count:
+            return f"已清空该用户的全部收藏，共删除 {count} 条。"
+        return "该用户本来就没有收藏，无需清空。"
 
     return [
         search_news,
@@ -119,4 +156,7 @@ def create_tools(user: User):
         get_favorites,
         get_history,
         recommend_by_history,
+        clear_history,
+        remove_favorite,
+        clear_favorites,
     ]

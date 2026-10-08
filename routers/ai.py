@@ -1,29 +1,67 @@
+import asyncio
+import importlib
 import json
+import sys
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
-from ai.agent import resume_agent_response, stream_agent_response
-from ai.vector_store import get_retriever, is_index_ready, rebuild_index
 from config.db_config import get_db
+from crud import news as news_crud
 from models.users import User
 from utils.auth import get_current_user
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
 
 
+def _load_ai_agent():
+    """同步 import ai.agent（供 asyncio.to_thread 在线程里调用）。"""
+    return importlib.import_module("ai.agent")
+
+
+async def _ai_agent():
+    """惰性拿到 ai.agent 模块。
+
+    本路由不在模块顶层 import ai.agent —— 那会连带把 langchain / langgraph
+    一起拉进来，服务启动要等十几秒。第一次真正调用 AI 接口时才 import，
+    且放进线程里做，避免卡住事件循环；之后模块已在 sys.modules 里，直接取用，秒回。
+
+    判据为什么是「有没有 stream_agent_response 属性」而不是「在不在 sys.modules」？
+        Python 是「先把模块塞进 sys.modules、再执行模块体」。后台预热线程刚开始
+        import ai.agent 时，模块已经在 sys.modules 里、但里面还是半成品，
+        这时按「在不在 sys.modules」判断会误以为已就绪，取属性就 AttributeError。
+        而 import_module 遇到别的线程正在 import 同一模块时会在模块锁上等，
+        等它执行完才返回，所以走这一条路拿到的永远是完整模块。
+    """
+    agent_mod = sys.modules.get("ai.agent")
+    if agent_mod is not None and hasattr(agent_mod, "stream_agent_response"):
+        return agent_mod
+    return await asyncio.to_thread(_load_ai_agent)
+
+
 def _sse(item) -> str:
     """把 agent 流里的一项转成 SSE 报文。
 
-    - str            → 普通的模型输出分片
+    - str             → 普通的模型输出分片
     - {"interrupt":…} → 需要人工审批：前端收到 [INTERRUPT] 后应弹出审批框，
                         再调 /api/ai/approve 继续。
+    - {"tool":…}      → 工具开始执行（前端显示工具调用提示）
+    - {"tool_end":…}  → 工具执行结束
     """
-    if isinstance(item, dict) and "interrupt" in item:
-        payload = json.dumps(item["interrupt"], ensure_ascii=False)
-        return f"data: [INTERRUPT] {payload}\n\n"
-    return f"data: {item}\n\n"
+    if isinstance(item, dict):
+        if "interrupt" in item:
+            payload = json.dumps(item["interrupt"], ensure_ascii=False)
+            return f"data: [INTERRUPT] {payload}\n\n"
+        if "tool" in item:
+            payload = json.dumps(item["tool"], ensure_ascii=False)
+            return f"data: [TOOL] {payload}\n\n"
+        if "tool_end" in item:
+            payload = json.dumps(item["tool_end"], ensure_ascii=False)
+            return f"data: [TOOL_END] {payload}\n\n"
+    # 文本分片也用 json 编码：模型输出里可能带换行，直接拼 "data: {item}" 会让
+    # 一条 SSE 事件被拆成多行，前端按行解析时会丢内容。json 编码后保证是一行。
+    return f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
 
 
 @router.post("/chat")
@@ -31,17 +69,16 @@ async def ai_chat(
     body: dict,
     user: User = Depends(get_current_user),
 ):
+    agent_mod = await _ai_agent()
     messages = body.get("messages", [])
     thread_id = body.get("thread_id", str(user.id))
 
     if not messages:
         raise HTTPException(status_code=400, detail="messages不能为空")
-    if not is_index_ready():
-        raise HTTPException(status_code=503, detail="向量索引未就绪，请先调用 /api/ai/rebuild-index")
 
     async def generate():
         try:
-            async for item in stream_agent_response(user, messages, thread_id):
+            async for item in agent_mod.stream_agent_response(user, messages, thread_id):
                 yield _sse(item)
             yield "data: [DONE]\n\n"
         except Exception as e:
@@ -61,6 +98,7 @@ async def ai_approve(
         {"thread_id": "1", "decision": "approve"}
         {"thread_id": "1", "decision": "reject", "message": "不想看这条"}
     """
+    agent_mod = await _ai_agent()
     thread_id = body.get("thread_id", str(user.id))
     decision = body.get("decision", "approve")
     message = body.get("message")
@@ -74,7 +112,7 @@ async def ai_approve(
 
     async def generate():
         try:
-            async for item in resume_agent_response(user, thread_id, [one]):
+            async for item in agent_mod.resume_agent_response(user, thread_id, [one]):
                 yield _sse(item)
             yield "data: [DONE]\n\n"
         except Exception as e:
@@ -84,43 +122,23 @@ async def ai_approve(
 
 
 @router.post("/search")
-async def semantic_search(
+async def search(
     body: dict,
     db: AsyncSession = Depends(get_db),
 ):
-    """纯语义搜索：不经过 LLM，直接返回向量检索结果。"""
-    query = body.get("query", "")
+    """纯关键词搜索：不经过 LLM，直接返回数据库检索结果（调试/联调用）。"""
+    query = (body.get("query") or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="query参数不能为空")
-    if not is_index_ready():
-        raise HTTPException(status_code=503, detail="向量索引未就绪，请先调用 /api/ai/rebuild-index")
 
-    retriever = get_retriever()
-    docs = await retriever.ainvoke(query)
+    rows = await news_crud.search_news(db, query, limit=body.get("limit", 5))
     results = [
         {
-            "news_id": doc.metadata.get("news_id"),
-            "title": doc.metadata.get("title"),
-            "content": doc.page_content[:300],
-            "score": doc.metadata.get("score", 0),
+            "news_id": n.id,
+            "title": n.title,
+            "content": (n.description or n.content or "")[:300],
+            "score": score,
         }
-        for doc in docs
+        for n, score in rows
     ]
     return {"code": 200, "data": results, "message": "ok"}
-
-
-@router.post("/rebuild-index")
-async def rebuild_search_index(db: AsyncSession = Depends(get_db)):
-    """从 MySQL 重建向量索引（管理接口）。"""
-    try:
-        count = await rebuild_index(db)
-        return {"code": 200, "data": {"indexed_docs": count}, "message": f"成功重建索引，共 {count} 条文档"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"索引重建失败: {str(e)}")
-
-
-@router.get("/index-status")
-async def index_status():
-    """检查向量索引状态。"""
-    ready = is_index_ready()
-    return {"code": 200, "data": {"ready": ready}, "message": "ok"}

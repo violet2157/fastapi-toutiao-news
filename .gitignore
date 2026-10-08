@@ -9,6 +9,12 @@ dist/
 build/
 .claude/
 chroma_db/
-checkpoints.sqlite
+checkpoints.sqlite*
 *.log
 .idea/
+
+# 本地调试产物
+crawl_log.txt
+_s.json
+*.lnk
+start-dev.bat
