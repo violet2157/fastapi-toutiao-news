@@ -64,6 +64,26 @@ def _sse(item) -> str:
     return f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
 
 
+def _scoped_thread_id(user: User, raw_thread_id) -> str:
+    """把前端传来的 thread_id 收进「当前用户」的命名空间。
+
+    为什么必须这么做：
+        checkpointer 是拿 thread_id 当 key 存对话状态的。如果直接把 body 里的
+        thread_id 拿去查，A 用户只要传 B 的 thread_id，就能让 agent 带着 B 的
+        历史消息跑，B 搜过的新闻、收藏内容会出现在 A 的输出里（越权读取）。
+        approve 接口同理，还能恢复别人卡住的审批。
+
+    做法：
+        服务端强制加上 "u{user.id}:" 前缀。客户端传什么值都只能落在自己的
+        命名空间内，且无法伪造出别人的前缀（前缀由服务端拼，不由客户端提供），
+        跨用户访问从根上不可能。前端仍可自定义 thread_id 来区分同一个人开的
+        多个会话，只是它永远带不上别人的前缀。
+    """
+    raw = (raw_thread_id or "").strip() if isinstance(raw_thread_id, str) else ""
+    # 前端没传 / 传了空串时给个固定默认值：同一用户不传就落在同一个默认会话上
+    return f"u{user.id}:{raw or 'default'}"
+
+
 @router.post("/chat")
 async def ai_chat(
     body: dict,
@@ -71,7 +91,7 @@ async def ai_chat(
 ):
     agent_mod = await _ai_agent()
     messages = body.get("messages", [])
-    thread_id = body.get("thread_id", str(user.id))
+    thread_id = _scoped_thread_id(user, body.get("thread_id"))
 
     if not messages:
         raise HTTPException(status_code=400, detail="messages不能为空")
@@ -99,7 +119,7 @@ async def ai_approve(
         {"thread_id": "1", "decision": "reject", "message": "不想看这条"}
     """
     agent_mod = await _ai_agent()
-    thread_id = body.get("thread_id", str(user.id))
+    thread_id = _scoped_thread_id(user, body.get("thread_id"))
     decision = body.get("decision", "approve")
     message = body.get("message")
 
